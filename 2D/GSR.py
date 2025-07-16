@@ -13,9 +13,9 @@ import os
 def parse_args():
 	parser = argparse.ArgumentParser()
 	parser.add_argument('--device', type=str, default='0')
-	parser.add_argument('--dir', type=str, default='output_fast')
+	parser.add_argument('--dir', type=str, default='output_pinns')
 	parser.add_argument('--start_frame', type=int, default=0)
-	parser.add_argument('--init_cond', type=str, default='taylor_vortex')
+	parser.add_argument('--init_cond', type=str, default='burgers')
 	parser.add_argument('--dt', type=float, default=.01)
 	parser.add_argument('--last_time', type=float, default=10.)
 	return parser.parse_args()
@@ -26,7 +26,7 @@ torch.manual_seed(42)
 if cmd_args.device != 'cpu':
 	os.environ['CUDA_VISIBLE_DEVICES'] = cmd_args.device
 	torch.cuda.manual_seed_all(42)
-device = torch.device('cpu' if cmd_args.device == 'cpu' else 'cuda')
+device = torch.device('cuda' if cmd_args.device == 'cuda' else 'cpu')
 ti.init(arch=ti.cpu if cmd_args.device == 'cpu' else ti.cuda)
 
 TiArr = ti.types.ndarray()
@@ -39,7 +39,7 @@ class GaussianSplatting:
 		self.positions = torch.tensor(positions, dtype=torch.float, requires_grad=True, device=device)
 		self.scalings = torch.zeros((self.N, 2), requires_grad=True, device=device) # it's actually scalings reverse
 		self.rotations = torch.zeros(self.N, requires_grad=True, device=device)
-		self.values = torch.zeros((self.N, dim), requires_grad=True, device=device)
+		self.values = torch.nn.Parameter(torch.randn((self.N, dim), device=device) * 0.1)
 	
 	def set_lr(self, positions_lr, scalings_lr, rotations_lr, values_lr):
 		self.positions_lr = positions_lr
@@ -83,10 +83,10 @@ class GaussianSplatting:
 	
 	def load(self, filename):
 		parameters_dict = torch.load(filename)
-		self.positions = parameters_dict['positions']
-		self.scalings = parameters_dict['scalings']
-		self.rotations = parameters_dict['rotations']
-		self.values = parameters_dict['values']
+		self.positions = parameters_dict['positions'].requires_grad_(True)
+		self.scalings = parameters_dict['scalings'].requires_grad_(True)
+		self.rotations = parameters_dict['rotations'].requires_grad_(True)
+		self.values = parameters_dict['values'].requires_grad_(True)
 		self.N = self.positions.shape[0]
 		self.dim = self.values.shape[1]
 	
@@ -110,7 +110,7 @@ class GaussianSplatting:
 	def forward_single(self, x):
 		mu, sigma_inv = self.positions, self.get_variances()
 		per_splatting_value = self.values * torch.exp(-.5 * (x - mu)[:, None, :] @ sigma_inv @ (x - mu)[:, :, None]).squeeze(2)
-		return per_splatting_value.sum(axis=0)
+		return per_splatting_value.sum()
 	
 	def __call__(self, x):
 		if len(x.shape) == 1:
@@ -118,7 +118,7 @@ class GaussianSplatting:
 		mu, sigma_inv = self.positions, self.get_variances()
 		positions_differences = x[:, None, :] - mu[None, :, :]
 		per_splatting_values = self.values * torch.exp(-.5 * positions_differences[:, :, None, :] @ sigma_inv @ positions_differences[:, :, :, None]).squeeze(3)
-		return per_splatting_values.sum(axis=1)
+		return per_splatting_values.sum(dim=0)
 	
 	def gradient_single(self, x, need_val=False):
 		'''
@@ -127,8 +127,8 @@ class GaussianSplatting:
 		'''
 		mu, sigma_inv = self.positions, self.get_variances()
 		per_splatting_value = self.values * torch.exp(-.5 * (x - mu)[:, None, :] @ sigma_inv @ (x - mu)[:, :, None]).squeeze(2)
-		y = per_splatting_value.sum(axis=0)
-		grad = -(per_splatting_value[:, :, None] @ (sigma_inv @ (x - mu)[:, :, None]).transpose(-1, -2)).sum(axis=0)
+		y = per_splatting_value.sum()
+		grad = -(per_splatting_value[:, :, None] @ (sigma_inv @ (x - mu)[:, :, None]).transpose(-1, -2)).sum(dim=0)
 		return (grad, y) if need_val else grad
 	
 	def gradient(self, x, need_val=False):
@@ -142,8 +142,8 @@ class GaussianSplatting:
 		mu, sigma_inv = self.positions, self.get_variances()
 		positions_differences = x[:, None, :] - mu[None, :, :]
 		per_splatting_values = self.values * torch.exp(-.5 * positions_differences[:, :, None, :] @ sigma_inv @ positions_differences[:, :, :, None]).squeeze(3)
-		y = per_splatting_values.sum(axis=1)
-		grad = -(per_splatting_values[:, :, :, None] @ (sigma_inv @ positions_differences[:, :, :, None]).transpose(-1, -2)).sum(axis=1)
+		y = per_splatting_values.sum(dim=0)
+		grad = -(per_splatting_values[:, :, :, None] @ (sigma_inv @ positions_differences[:, :, :, None]).transpose(-1, -2)).sum(dim=0)
 		return (grad, y) if need_val else grad
 	
 	def freeze(self):
@@ -168,6 +168,10 @@ class GaussianSplatting:
 		for s in self.schedulers:
 			s.step(metrics)
 
+	def clamp_positions(self, x_min, x_max, t_min, t_max):
+		self.positions.data[:, 0].clamp_(x_min, x_max)
+		self.positions.data[:, 1].clamp_(t_min, t_max)
+
 
 @ti.data_oriented
 class GaussianSplattingFast(GaussianSplatting):
@@ -176,9 +180,9 @@ class GaussianSplattingFast(GaussianSplatting):
 			
 			# 添加PDE loss三个部分的存储
 			self.pde_loss_parts = {
-				'A': 0.0,  # Σ_i v_i ∂G_i(x)/∂t
-				'B': 0.0,  # Σ_i (G_i(x)-c)v_i
-				'C': 0.0   # Σ_i v_i ∂G_i(x)/∂x
+				'A': 1.0,  # Σ_i v_i ∂G_i(x)/∂t
+				'B': 1.0,  # Σ_i (G_i(x)-c)v_i
+				'C': 1.0   # Σ_i v_i ∂G_i(x)/∂x
 			}
 			
 			if load_file is None:
@@ -249,10 +253,10 @@ class GaussianSplattingFast(GaussianSplatting):
 		
 		def load(self, filename):
 			parameters_dict = torch.load(filename)
-			self.positions = parameters_dict['positions']
-			self.scalings = parameters_dict['scalings']
-			self.rotations = parameters_dict['rotations']
-			self.values = parameters_dict['values']
+			self.positions = parameters_dict['positions'].requires_grad_(True)
+			self.scalings = parameters_dict['scalings'].requires_grad_(True)
+			self.rotations = parameters_dict['rotations'].requires_grad_(True)
+			self.values = parameters_dict['values'].requires_grad_(True)
 			self.N = self.positions.shape[0]
 			self.dim = self.values.shape[1]
 			self.clamp_threshold = parameters_dict['clamp_threshold']
@@ -266,12 +270,15 @@ class GaussianSplattingFast(GaussianSplatting):
 					   positions: TiArr, scalings: TiArr, rotations: TiArr, values: TiArr,
 					   grid_scale: ti.f32,
 					   x: TiArr,
-					   ref: TiArr, weight: ti.f32,
-					   normals: TiArr, normal_ref: TiArr, weight_boundary: ti.f32,
+					   weight: ti.f32,
+					   weight_boundary: ti.f32,
+					   weight_initial: ti.f32,
 					   val: TiArr,
 					   stop_gradient: TiArr,
 					   pde_parts: TiArr,
-					   pde_parts_per_point: TiArr,  # 新增参数
+					   pde_parts_per_point: TiArr, 
+					   boundary_loss: TiArr,
+					   initial_loss: TiArr,
 					   dim: ti.i32): 
 			#forward pass
 			m = x.shape[0]
@@ -307,21 +314,23 @@ class GaussianSplattingFast(GaussianSplatting):
 										b += values[j_id, d] * (gaussian - self.clamp_threshold)
 									for d in range(dim):
 										c += values[j_id, d] * grad_gaussian[0]
+								
 				# 存储每个点的A/B/C
 				pde_parts_per_point[i, 0] = a
 				pde_parts_per_point[i, 1] = b
 				pde_parts_per_point[i, 2] = c
+				pde_parts_per_point[i, 3] = weight*(a + b * c)**2
 				# 同时累加到全局
 				pde_parts[0] += a
 				pde_parts[1] += b
 				pde_parts[2] += c
+				boundary_loss[i] = weight_boundary * (val[i,0])**2
+				initial_loss[i] = weight_initial * (val[i,0]+tm.sin(tm.pi*x[i,0]))**2
 			#backward pass
 			if weight == 0 and weight_boundary == 0:    # disable backward
 				m = 0
 			# (warning: need atomic '+=')
 			for i in range(m):
-				is_boundary_point = (abs(x[i, 0] + 1.0) < 1e-5) or (abs(x[i, 0] - 1.0) < 1e-5)
-				is_initial_point = (abs(x[i, 1]) < 1e-5)
 				idx, idy = int((x[i, 0] - self.x_min) // grid_scale), int((x[i, 1] - self.y_min) // grid_scale)
 				for gi in range(max(idx - 1, 0), min(idx + 1, self.grid_size[0] - 1) + 1):
 					for gj in range(max(idy - 1, 0), min(idy + 1, self.grid_size[1] - 1) + 1):
@@ -335,6 +344,7 @@ class GaussianSplattingFast(GaussianSplatting):
 							cov_inv = R @ S2 @ R.transpose()
 							gaussian = tm.exp(-.5 * delta_pos @ cov_inv @ delta_pos)
 							grad_gaussian = -gaussian * (cov_inv @ delta_pos)
+							f1=2*(pde_parts_per_point[i, 0]+pde_parts_per_point[i, 1]*pde_parts_per_point[i, 2])
 							if gaussian >= self.clamp_threshold:	# within range
 								# val_dot_normal = 0.
 								# for d in range(dim):
@@ -344,23 +354,27 @@ class GaussianSplattingFast(GaussianSplatting):
 
 								# derivative w.r.t. values
 								# derivative of loss
-								values.grad[j_id, 0] += grad_gaussian[1]+(gaussian-self.clamp_threshold)*pde_parts_per_point[i, 2]+pde_parts_per_point[i, 1]*grad_gaussian[0]
+								values.grad[j_id, 0] += weight / m *f1*(grad_gaussian[1]+(gaussian-self.clamp_threshold)*pde_parts_per_point[i, 2]+pde_parts_per_point[i, 1]*grad_gaussian[0])
 								# derivative of loss_boundary_condition
-								if is_boundary_point:
-									values.grad[j_id, 0] += weight_boundary / m *2.0*val[i,0]*(gaussian-self.clamp_threshold)
-								if is_initial_point:
-									values.grad[j_id, 0] +=weight_boundary/m* 2*(val[i,0]+tm.sin(tm.pi*x[i,0]))*(gaussian-self.clamp_threshold)
+								values.grad[j_id, 0] += weight_boundary / m *2.0*val[i,0]*(gaussian-self.clamp_threshold)
+								values.grad[j_id, 0] +=weight_initial/m* 2.0*(val[i,0]+tm.sin(tm.pi*x[i,0]))*(gaussian-self.clamp_threshold)
 								# derivative w.r.t. positions
-								positions.grad[j_id, 0] += weight / (2. * m) * (values[j_id,0]*(grad_gaussian@cov_inv+gaussian@cov_inv@tm.vec2(1.,0.)@(cov_inv@delta_pos).transpose)+values[j_id,0]*gaussian@cov_inv@delta_pos*pde_parts_per_point[i, 2]+pde_parts_per_point[i,1]*values[j_id,0]*(grad_gaussian@cov_inv+gaussian@cov_inv@tm.vec2(0.,1.)@(cov_inv@delta_pos).transpose))[0]
-								positions.grad[j_id, 1] += weight / (2. * m) * (values[j_id,1]*(grad_gaussian@cov_inv+gaussian@cov_inv@tm.vec2(0.,1.)@(cov_inv@delta_pos).transpose)+values[j_id,1]*gaussian@cov_inv@delta_pos*pde_parts_per_point[i, 2]+pde_parts_per_point[i,1]*values[j_id,1]*(grad_gaussian@cov_inv+gaussian@cov_inv@tm.vec2(0.,1.)@(cov_inv@delta_pos).transpose))[1]
+								positions.grad[j_id, 0] += weight / (2. * m) * f1*(
+                                    values[j_id,0]*((cov_inv @ grad_gaussian)[0] + gaussian * tm.vec2(1.,0.).dot(cov_inv @ delta_pos))
+                                    + values[j_id,0]*gaussian*(cov_inv @ delta_pos)[0]*pde_parts_per_point[i, 2]
+                                    + pde_parts_per_point[i,1]*values[j_id,0]*((cov_inv @ grad_gaussian)[0] + gaussian * tm.vec2(0.,1.).dot(cov_inv @ delta_pos))
+                                )
+								positions.grad[j_id, 1] += weight / (2. * m) * f1*(
+                                    values[j_id,1]*((cov_inv @ grad_gaussian)[1] + gaussian * tm.vec2(0.,1.).dot(cov_inv @ delta_pos))
+                                    + values[j_id,1]*gaussian*(cov_inv @ delta_pos)[1]*pde_parts_per_point[i, 2]
+                                    + pde_parts_per_point[i,1]*values[j_id,1]*((cov_inv @ grad_gaussian)[1] + gaussian * tm.vec2(0.,1.).dot(cov_inv @ delta_pos))
+                                )
 								# derivative of loss_boundary
-								if is_boundary_point:
-									positions.grad[j_id, 0] +=2*val[i,0]*values[j_id,0]*gaussian*cov_inv@delta_pos[0]
-									positions.grad[j_id, 1] +=2*val[i,0]*values[j_id,0]*gaussian*cov_inv@delta_pos[1]
+								positions.grad[j_id, 0] +=weight_boundary/m*2*val[i,0]*values[j_id,0]*gaussian*(cov_inv @ delta_pos)[0]
+								positions.grad[j_id, 1] +=weight_boundary/m*2*val[i,0]*values[j_id,0]*gaussian*(cov_inv @ delta_pos)[1]
 								# derivative of initial_point
-								if is_initial_point:
-									positions.grad[j_id, 0] +=weight_boundary/m*2.0*(val[i,0]+tm.sin(tm.pi*x[i,0]))*values[j_id,0]*gaussian*cov_inv@delta_pos[0]
-									positions.grad[j_id, 1] +=weight_boundary/m*2.0*(val[i,0]+tm.sin(tm.pi*x[i,0]))*values[j_id,0]*gaussian*cov_inv@delta_pos[1]
+								positions.grad[j_id, 0] +=weight_initial/m*2.0*(val[i,0]+tm.sin(tm.pi*x[i,0]))*values[j_id,0]*gaussian*(cov_inv @ delta_pos)[0]
+								positions.grad[j_id, 1] +=weight_initial/m*2.0*(val[i,0]+tm.sin(tm.pi*x[i,0]))*values[j_id,0]*gaussian*(cov_inv @ delta_pos)[1]
 								# derivative w.r.t. scalings
 								# derivative of loss
 								M_x = tm.mat2([[2.0 * tm.exp(2.0 * scalings[j_id, 0]), 0.0], [0.0, 0.0]])
@@ -375,7 +389,7 @@ class GaussianSplattingFast(GaussianSplatting):
 								term3_x = B_i * (-0.5 * delta_d_cov_inv_ds_delta_x * a_i[0] - d_cov_inv_ds_delta_x[0])
 								total_x = term1_x + term2_x + term3_x
 
-								scalings.grad[j_id, 0] += weight / (2. * m) * values[j_id, 0] * gaussian * total_x
+								scalings.grad[j_id, 0] += weight / (2. * m) * f1*values[j_id, 0] * gaussian * total_x
 
 								M_y = tm.mat2([[0.0, 0.0], [0.0, 2.0 * tm.exp(2.0 * scalings[j_id, 1])]])
 								d_cov_inv_ds_y = R @ M_y @ R.transpose()
@@ -387,21 +401,19 @@ class GaussianSplattingFast(GaussianSplatting):
 								term3_y = B_i * (-0.5 * delta_d_cov_inv_ds_delta_y * a_i[0] - d_cov_inv_ds_delta_y[0])
 								total_y = term1_y + term2_y + term3_y
 
-								scalings.grad[j_id, 1] += weight / (2. * m) * values[j_id, 0] * gaussian * total_y
+								scalings.grad[j_id, 1] += weight / (2. * m) * f1*values[j_id, 0] * gaussian * total_y
 								# derivative of loss_boundary
-								if is_boundary_point:
-									for k in range(2):  # k=0,1
-										r_k = tm.vec2(R[0, k], R[1, k])
-										dot_rk_delta = r_k.dot(delta_pos)
-										exp_2s = tm.exp(2.0 * scalings[j_id, k])
-										scalings.grad[j_id, k] += -2.0 * val[i,0] * values[j_id, 0] * gaussian * exp_2s * (dot_rk_delta ** 2)
+								for k in range(2):  # k=0,1
+									r_k = tm.vec2(R[0, k], R[1, k])
+									dot_rk_delta = r_k.dot(delta_pos)
+									exp_2s = tm.exp(2.0 * scalings[j_id, k])
+									scalings.grad[j_id, k] += weight_boundary/m * -2.0 * val[i,0] * values[j_id, 0] * gaussian * exp_2s * (dot_rk_delta ** 2)
 								# derivative of initial_point
-								if is_initial_point:
-									for k in range(2):  # k=0,1
-										r_k = tm.vec2(R[0, k], R[1, k])
-										dot_rk_delta = r_k.dot(delta_pos)
-										exp_2s = tm.exp(2.0 * scalings[j_id, k])
-										scalings.grad[j_id, k] += -2.0 * (val[i,0]+tm.sin(tm.pi*x[i,0])) * values[j_id, 0] * gaussian * exp_2s * (dot_rk_delta ** 2)
+								for k in range(2):  # k=0,1
+									r_k = tm.vec2(R[0, k], R[1, k])
+									dot_rk_delta = r_k.dot(delta_pos)
+									exp_2s = tm.exp(2.0 * scalings[j_id, k])
+									scalings.grad[j_id, k] += weight_initial/m * -2.0 * (val[i,0]+tm.sin(tm.pi*x[i,0])) * values[j_id, 0] * gaussian * exp_2s * (dot_rk_delta ** 2)
 								
 								# derivative w.r.t. rotations
 								# derivative of loss
@@ -424,41 +436,36 @@ class GaussianSplattingFast(GaussianSplatting):
 								term2 = B_i * (0.5 * alpha_i * a_i_x - beta_i_x)
 								term3 = -0.5 * alpha_i * C_i
 								rot_grad = values[j_id, 0] * gaussian * (term1 + term2 + term3)
-								rotations.grad[j_id] += weight / (2. * m) * rot_grad
+								rotations.grad[j_id] += weight / (2. * m) * f1*rot_grad
 								# derivative of loss_boundary
-								if is_boundary_point:
-									rotations.grad[j_id]+=weight_boundary/m *(-2.0*val[i,0]*values[j_id,0]*gaussian*delta_pos.transpose()@d_cov_inv_dtheta@delta_pos)
+								rotations.grad[j_id]+=weight_boundary/m *(-2.0*val[i,0]*values[j_id,0]*gaussian*delta_pos.dot(d_cov_inv_dtheta @ delta_pos))
 								# derivative of initial_point
-								if is_initial_point:
-									rotations.grad[j_id]+=weight_boundary/m *(-2.0*(val[i,0]+tm.sin(tm.pi*x[i,0]))*values[j_id,0]*gaussian*delta_pos.transpose()@d_cov_inv_dtheta@delta_pos)
+								rotations.grad[j_id]+=weight_initial/m *(-2.0*(val[i,0]+tm.sin(tm.pi*x[i,0]))*values[j_id,0]*gaussian*delta_pos.dot(d_cov_inv_dtheta @ delta_pos))
 		
-		def get_losses(self, x, ref=None, weight=0., normals=None, normal_ref=None, weight_boundary=0., stop_gradient=None):
-			if ref is None:
-				ref = torch.zeros((x.shape[0], self.dim), device=device)
-				weight = 0.
-			if normals is None or normal_ref is None:
-				normals = torch.zeros((x.shape[0], self.dim), device=device)
-				normal_ref = torch.zeros(x.shape[0], device=device)
-				weight_boundary = 0.
+		def get_losses(self, x,  weight=0., weight_boundary=0., weight_initial=0., stop_gradient=None):
 			if stop_gradient is None:
 				stop_gradient = torch.zeros((self.positions.shape[0],), dtype=torch.int32, device=device)
 			val = torch.zeros((x.shape[0], self.dim), device=device)
-			
+			boundary_loss = torch.zeros((x.shape[0],), device=device)
+			initial_loss = torch.zeros((x.shape[0],), device=device)
 			# 创建PDE parts存储数组
 			pde_parts = torch.zeros(3, device=device)  # [A, B, C]
 			# 新增：每个点的ABC loss
-			pde_parts_per_point = torch.zeros((x.shape[0], 3), device=device)
+			pde_parts_per_point = torch.zeros((x.shape[0], 4), device=device)
 			
 			self.get_losses_ti(
 				self.positions, self.scalings, self.rotations, self.values,
 				self.grid_scale,
 				x,
-				ref, weight,
-				normals, normal_ref, weight_boundary,
+				weight,
+				weight_boundary,
+				weight_initial,
 				val,
 				stop_gradient,
 				pde_parts,
-				pde_parts_per_point,  # 新增参数
+				pde_parts_per_point,
+				boundary_loss,
+				initial_loss,	
 				self.dim)
 			
 			# 将计算结果存储到类属性中
@@ -467,7 +474,9 @@ class GaussianSplattingFast(GaussianSplatting):
 			self.pde_loss_parts['C'] = pde_parts[2].item()
 			# 新增：存储每个点的ABC loss
 			self.pde_loss_parts_per_point = pde_parts_per_point.cpu().numpy()
-			return val, pde_parts_per_point
+			self.boundary_loss = boundary_loss.mean()
+			self.initial_loss = initial_loss.mean()
+			return val, self.pde_loss_parts_per_point[:, 3], self.boundary_loss, self.initial_loss			
 		
 		def get_pde_loss_parts(self):
 			"""
@@ -481,237 +490,234 @@ class GaussianSplattingFast(GaussianSplatting):
 			"""
 			print(f"A: {self.pde_loss_parts['A']:.6f}, B: {self.pde_loss_parts['B']:.6f}, C: {self.pde_loss_parts['C']:.6f}")
 		
-		def __call__(self, x):
-			return self.get_losses(x)
-		
-		@ti.kernel
-		def get_grad_losses_ti(self,
-							positions: TiArr, scalings: TiArr, rotations: TiArr, values: TiArr,
-							grid_scale: ti.f32,
-							x: TiArr,
-							ref_grad: TiArr, weight_grad: ti.f32,
-							ref_vor: TiArr, weight_vor: ti.f32,
-							weight_div: ti.f32,
-							grad: TiArr,
-							vor_positions_grad: TiArr, vor_scalings_grad: TiArr, vor_rotations_grad: TiArr, vor_values_grad: TiArr,
-							div_positions_grad: TiArr, div_scalings_grad: TiArr, div_rotations_grad: TiArr, div_values_grad: TiArr,
-							stop_gradient: TiArr):
-			m = x.shape[0]
-			for i in range(m):
-				for d in range(self.dim):
-					grad[i, d, 0] = grad[i, d, 1] = 0.
-				idx, idy = int((x[i, 0] - self.x_min) // grid_scale), int((x[i, 1] - self.y_min) // grid_scale)
-				for gi in range(max(idx - 1, 0), min(idx + 1, self.grid_size[0] - 1) + 1):
-					for gj in range(max(idy - 1, 0), min(idy + 1, self.grid_size[1] - 1) + 1):
-						for j in range(ti.i32(self.grid_cnt[gi, gj])):
-							j_id = self.sorted_id[self.grid_offset[gi, gj] + j]
-							delta_pos = tm.vec2(x[i, 0] - positions[j_id, 0], x[i, 1] - positions[j_id, 1])
-							R = tm.mat2([[tm.cos(rotations[j_id]), -tm.sin(rotations[j_id])], [tm.sin(rotations[j_id]), tm.cos(rotations[j_id])]])
-							S2 = tm.mat2([[tm.exp(2. * scalings[j_id, 0]), 0.], [0., tm.exp(2. * scalings[j_id, 1])]])
-							cov_inv = R @ S2 @ R.transpose()
-							gaussian = tm.exp(-.5 * delta_pos @ cov_inv @ delta_pos)
-							if gaussian >= self.clamp_threshold:	# within range
-								grad_gaussian = -gaussian * (cov_inv @ delta_pos)
-								for d in range(self.dim):
-									grad[i, d, 0] += values[j_id, d] * grad_gaussian[0]
-									grad[i, d, 1] += values[j_id, d] * grad_gaussian[1]
-			if weight_grad == 0 and weight_vor == 0 and weight_div == 0:	# enable backward
-				m = 0
-			for i in range(m):
-				idx, idy = int((x[i, 0] - self.x_min) // grid_scale), int((x[i, 1] - self.y_min) // grid_scale)
-				for gi in range(max(idx - 1, 0), min(idx + 1, self.grid_size[0] - 1) + 1):
-					for gj in range(max(idy - 1, 0), min(idy + 1, self.grid_size[1] - 1) + 1):
-						for j in range(ti.i32(self.grid_cnt[gi, gj])):
-							j_id = self.sorted_id[self.grid_offset[gi, gj] + j]
-							if stop_gradient[j_id]:
-								continue
-							delta_pos = tm.vec2(x[i, 0] - positions[j_id, 0], x[i, 1] - positions[j_id, 1])
-							R = tm.mat2([[tm.cos(rotations[j_id]), -tm.sin(rotations[j_id])], [tm.sin(rotations[j_id]), tm.cos(rotations[j_id])]])
-							S2 = tm.mat2([[tm.exp(2. * scalings[j_id, 0]), 0.], [0., tm.exp(2. * scalings[j_id, 1])]])
-							cov_inv = R @ S2 @ R.transpose()
-							gaussian = tm.exp(-.5 * delta_pos @ cov_inv @ delta_pos)
-							if gaussian >= self.clamp_threshold:	# within range
-								grad_gaussian = -gaussian * (cov_inv @ delta_pos)
+		# @ti.kernel
+		# def get_grad_losses_ti(self,
+		# 					positions: TiArr, scalings: TiArr, rotations: TiArr, values: TiArr,
+		# 					grid_scale: ti.f32,
+		# 					x: TiArr,
+		# 					ref_grad: TiArr, weight_grad: ti.f32,
+		# 					ref_vor: TiArr, weight_vor: ti.f32,
+		# 					weight_div: ti.f32,
+		# 					grad: TiArr,
+		# 					vor_positions_grad: TiArr, vor_scalings_grad: TiArr, vor_rotations_grad: TiArr, vor_values_grad: TiArr,
+		# 					div_positions_grad: TiArr, div_scalings_grad: TiArr, div_rotations_grad: TiArr, div_values_grad: TiArr,
+		# 					stop_gradient: TiArr):
+		# 	m = x.shape[0]
+		# 	for i in range(m):
+		# 		for d in range(self.dim):
+		# 			grad[i, d, 0] = grad[i, d, 1] = 0.
+		# 		idx, idy = int((x[i, 0] - self.x_min) // grid_scale), int((x[i, 1] - self.y_min) // grid_scale)
+		# 		for gi in range(max(idx - 1, 0), min(idx + 1, self.grid_size[0] - 1) + 1):
+		# 			for gj in range(max(idy - 1, 0), min(idy + 1, self.grid_size[1] - 1) + 1):
+		# 				for j in range(ti.i32(self.grid_cnt[gi, gj])):
+		# 					j_id = self.sorted_id[self.grid_offset[gi, gj] + j]
+		# 					delta_pos = tm.vec2(x[i, 0] - positions[j_id, 0], x[i, 1] - positions[j_id, 1])
+		# 					R = tm.mat2([[tm.cos(rotations[j_id]), -tm.sin(rotations[j_id])], [tm.sin(rotations[j_id]), tm.cos(rotations[j_id])]])
+		# 					S2 = tm.mat2([[tm.exp(2. * scalings[j_id, 0]), 0.], [0., tm.exp(2. * scalings[j_id, 1])]])
+		# 					cov_inv = R @ S2 @ R.transpose()
+		# 					gaussian = tm.exp(-.5 * delta_pos @ cov_inv @ delta_pos)
+		# 					if gaussian >= self.clamp_threshold:	# within range
+		# 						grad_gaussian = -gaussian * (cov_inv @ delta_pos)
+		# 						for d in range(self.dim):
+		# 							grad[i, d, 0] += values[j_id, d] * grad_gaussian[0]
+		# 							grad[i, d, 1] += values[j_id, d] * grad_gaussian[1]
+		# 	if weight_grad == 0 and weight_vor == 0 and weight_div == 0:	# enable backward
+		# 		m = 0
+		# 	for i in range(m):
+		# 		idx, idy = int((x[i, 0] - self.x_min) // grid_scale), int((x[i, 1] - self.y_min) // grid_scale)
+		# 		for gi in range(max(idx - 1, 0), min(idx + 1, self.grid_size[0] - 1) + 1):
+		# 			for gj in range(max(idy - 1, 0), min(idy + 1, self.grid_size[1] - 1) + 1):
+		# 				for j in range(ti.i32(self.grid_cnt[gi, gj])):
+		# 					j_id = self.sorted_id[self.grid_offset[gi, gj] + j]
+		# 					if stop_gradient[j_id]:
+		# 						continue
+		# 					delta_pos = tm.vec2(x[i, 0] - positions[j_id, 0], x[i, 1] - positions[j_id, 1])
+		# 					R = tm.mat2([[tm.cos(rotations[j_id]), -tm.sin(rotations[j_id])], [tm.sin(rotations[j_id]), tm.cos(rotations[j_id])]])
+		# 					S2 = tm.mat2([[tm.exp(2. * scalings[j_id, 0]), 0.], [0., tm.exp(2. * scalings[j_id, 1])]])
+		# 					cov_inv = R @ S2 @ R.transpose()
+		# 					gaussian = tm.exp(-.5 * delta_pos @ cov_inv @ delta_pos)
+		# 					if gaussian >= self.clamp_threshold:	# within range
+		# 						grad_gaussian = -gaussian * (cov_inv @ delta_pos)
 								
-								sign_vor_diff = 0.
-								div2 = 0.
-								value = tm.vec2(0., 0.)
-								if self.dim == 2:
-									sign_vor_diff = tm.sign((grad[i, 1, 0] - grad[i, 0, 1]) - ref_vor[i])
-									div2 = 2. * (grad[i, 0, 0] + grad[i, 1, 1])
-									value[0], value[1] = values[j_id, 0], values[j_id, 1]
-								# derivative w.r.t. values
-								for d in range(self.dim):
-									# derivative of loss_grad
-									values.grad[j_id, d] += weight_grad / (4. * m) * tm.sign(tm.vec2(grad[i, d, 0], grad[i, d, 1]) - tm.vec2(ref_grad[i, d, 0], ref_grad[i, d, 1])).dot(grad_gaussian)
-								if self.dim == 2:
-									# derivative of loss_vor
-									vor_values_grad[j_id, 0] += weight_vor / m * sign_vor_diff * -grad_gaussian[1]
-									vor_values_grad[j_id, 1] += weight_vor / m * sign_vor_diff * grad_gaussian[0]
-									# derivative of loss_div
-									div_values_grad[j_id, 0] += weight_div / m * div2 * grad_gaussian[0]
-									div_values_grad[j_id, 1] += weight_div / m * div2 * grad_gaussian[1]
+		# 						sign_vor_diff = 0.
+		# 						div2 = 0.
+		# 						value = tm.vec2(0., 0.)
+		# 						if self.dim == 2:
+		# 							sign_vor_diff = tm.sign((grad[i, 1, 0] - grad[i, 0, 1]) - ref_vor[i])
+		# 							div2 = 2. * (grad[i, 0, 0] + grad[i, 1, 1])
+		# 							value[0], value[1] = values[j_id, 0], values[j_id, 1]
+		# 						# derivative w.r.t. values
+		# 						for d in range(self.dim):
+		# 							# derivative of loss_grad
+		# 							values.grad[j_id, d] += weight_grad / (4. * m) * tm.sign(tm.vec2(grad[i, d, 0], grad[i, d, 1]) - tm.vec2(ref_grad[i, d, 0], ref_grad[i, d, 1])).dot(grad_gaussian)
+		# 						if self.dim == 2:
+		# 							# derivative of loss_vor
+		# 							vor_values_grad[j_id, 0] += weight_vor / m * sign_vor_diff * -grad_gaussian[1]
+		# 							vor_values_grad[j_id, 1] += weight_vor / m * sign_vor_diff * grad_gaussian[0]
+		# 							# derivative of loss_div
+		# 							div_values_grad[j_id, 0] += weight_div / m * div2 * grad_gaussian[0]
+		# 							div_values_grad[j_id, 1] += weight_div / m * div2 * grad_gaussian[1]
 								
-								# derivative w.r.t. positions
-								d_grad_gaussian_position = gaussian * cov_inv @ (tm.eye(2) - delta_pos.outer_product(delta_pos) @ cov_inv)
-								sign_times_value = tm.vec2(0., 0.)
-								for d in range(self.dim):
-									sign_times_value += tm.sign(tm.vec2(grad[i, d, 0] - ref_grad[i, d, 0], grad[i, d, 1] - ref_grad[i, d, 1])) * values[j_id, d]
-								sign_dvor_times_value = sign_vor_diff * tm.mat2([[0., 1.], [-1., 0.]]) @ value
-								sign_div2_times_value = div2 * value
-								# derivative of loss_grad
-								positions.grad[j_id, 0] += weight_grad / (4. * m) * d_grad_gaussian_position[:, 0].dot(sign_times_value)
-								positions.grad[j_id, 1] += weight_grad / (4. * m) * d_grad_gaussian_position[:, 1].dot(sign_times_value)
-								if self.dim == 2:
-									# derivative of loss_vor
-									vor_positions_grad[j_id, 0] += weight_vor / m * d_grad_gaussian_position[:, 0].dot(sign_dvor_times_value)
-									vor_positions_grad[j_id, 1] += weight_vor / m * d_grad_gaussian_position[:, 1].dot(sign_dvor_times_value)
-									# derivative of loss_div
-									div_positions_grad[j_id, 0] += weight_div / m * d_grad_gaussian_position[:, 0].dot(sign_div2_times_value)
-									div_positions_grad[j_id, 1] += weight_div / m * d_grad_gaussian_position[:, 1].dot(sign_div2_times_value)
+		# 						# derivative w.r.t. positions
+		# 						d_grad_gaussian_position = gaussian * cov_inv @ (tm.eye(2) - delta_pos.outer_product(delta_pos) @ cov_inv)
+		# 						sign_times_value = tm.vec2(0., 0.)
+		# 						for d in range(self.dim):
+		# 							sign_times_value += tm.sign(tm.vec2(grad[i, d, 0] - ref_grad[i, d, 0], grad[i, d, 1] - ref_grad[i, d, 1])) * values[j_id, d]
+		# 						sign_dvor_times_value = sign_vor_diff * tm.mat2([[0., 1.], [-1., 0.]]) @ value
+		# 						sign_div2_times_value = div2 * value
+		# 						# derivative of loss_grad
+		# 						positions.grad[j_id, 0] += weight_grad / (4. * m) * d_grad_gaussian_position[:, 0].dot(sign_times_value)
+		# 						positions.grad[j_id, 1] += weight_grad / (4. * m) * d_grad_gaussian_position[:, 1].dot(sign_times_value)
+		# 						if self.dim == 2:
+		# 							# derivative of loss_vor
+		# 							vor_positions_grad[j_id, 0] += weight_vor / m * d_grad_gaussian_position[:, 0].dot(sign_dvor_times_value)
+		# 							vor_positions_grad[j_id, 1] += weight_vor / m * d_grad_gaussian_position[:, 1].dot(sign_dvor_times_value)
+		# 							# derivative of loss_div
+		# 							div_positions_grad[j_id, 0] += weight_div / m * d_grad_gaussian_position[:, 0].dot(sign_div2_times_value)
+		# 							div_positions_grad[j_id, 1] += weight_div / m * d_grad_gaussian_position[:, 1].dot(sign_div2_times_value)
 								
-								# derivative w.r.t. scalings
-								vec_cos_sin = tm.vec2(tm.cos(rotations[j_id]), tm.sin(rotations[j_id]))
-								d_grad_gaussian_scaling_0 = -(-gaussian * tm.exp(2. * scalings[j_id, 0]) * (vec_cos_sin.dot(delta_pos)) ** 2) * cov_inv @ delta_pos - gaussian * (2. * tm.exp(2. * scalings[j_id, 0]) * vec_cos_sin.outer_product(vec_cos_sin)) @ delta_pos
-								vec_negsin_cos = tm.vec2(-tm.sin(rotations[j_id]), tm.cos(rotations[j_id]))
-								d_grad_gaussian_scaling_1 = -(-gaussian * tm.exp(2. * scalings[j_id, 1]) * (vec_negsin_cos.dot(delta_pos)) ** 2) * cov_inv @ delta_pos - gaussian * (2. * tm.exp(2. * scalings[j_id, 1]) * vec_negsin_cos.outer_product(vec_negsin_cos)) @ delta_pos
-								# derivative of loss_grad
-								scalings.grad[j_id, 0] += weight_grad / (4. * m) * d_grad_gaussian_scaling_0.dot(sign_times_value)
-								scalings.grad[j_id, 1] += weight_grad / (4. * m) * d_grad_gaussian_scaling_1.dot(sign_times_value)
-								if self.dim == 2:
-									# derivative of loss_vor
-									vor_scalings_grad[j_id, 0] += weight_vor / m * d_grad_gaussian_scaling_0.dot(sign_dvor_times_value)
-									vor_scalings_grad[j_id, 1] += weight_vor / m * d_grad_gaussian_scaling_1.dot(sign_dvor_times_value)
-									# derivative of loss_div
-									div_scalings_grad[j_id, 0] += weight_div / m * d_grad_gaussian_scaling_0.dot(sign_div2_times_value)
-									div_scalings_grad[j_id, 1] += weight_div / m * d_grad_gaussian_scaling_1.dot(sign_div2_times_value)
+		# 						# derivative w.r.t. scalings
+		# 						vec_cos_sin = tm.vec2(tm.cos(rotations[j_id]), tm.sin(rotations[j_id]))
+		# 						d_grad_gaussian_scaling_0 = -(-gaussian * tm.exp(2. * scalings[j_id, 0]) * (vec_cos_sin.dot(delta_pos)) ** 2) * cov_inv @ delta_pos - gaussian * (2. * tm.exp(2. * scalings[j_id, 0]) * vec_cos_sin.outer_product(vec_cos_sin)) @ delta_pos
+		# 						vec_negsin_cos = tm.vec2(-tm.sin(rotations[j_id]), tm.cos(rotations[j_id]))
+		# 						d_grad_gaussian_scaling_1 = -(-gaussian * tm.exp(2. * scalings[j_id, 1]) * (vec_negsin_cos.dot(delta_pos)) ** 2) * cov_inv @ delta_pos - gaussian * (2. * tm.exp(2. * scalings[j_id, 1]) * vec_negsin_cos.outer_product(vec_negsin_cos)) @ delta_pos
+		# 						# derivative of loss_grad
+		# 						scalings.grad[j_id, 0] += weight_grad / (4. * m) * d_grad_gaussian_scaling_0.dot(sign_times_value)
+		# 						scalings.grad[j_id, 1] += weight_grad / (4. * m) * d_grad_gaussian_scaling_1.dot(sign_times_value)
+		# 						if self.dim == 2:
+		# 							# derivative of loss_vor
+		# 							vor_scalings_grad[j_id, 0] += weight_vor / m * d_grad_gaussian_scaling_0.dot(sign_dvor_times_value)
+		# 							vor_scalings_grad[j_id, 1] += weight_vor / m * d_grad_gaussian_scaling_1.dot(sign_dvor_times_value)
+		# 							# derivative of loss_div
+		# 							div_scalings_grad[j_id, 0] += weight_div / m * d_grad_gaussian_scaling_0.dot(sign_div2_times_value)
+		# 							div_scalings_grad[j_id, 1] += weight_div / m * d_grad_gaussian_scaling_1.dot(sign_div2_times_value)
 								
-								# derivative w.r.t. rotations
-								d_cov_inv_rotation = (tm.exp(2. * scalings[j_id, 0]) - tm.exp(2. * scalings[j_id, 1])) * tm.mat2([[-tm.sin(2. * rotations[j_id]), tm.cos(2. * rotations[j_id])], [tm.cos(2. * rotations[j_id]), tm.sin(2. * rotations[j_id])]])
-								d_grad_gaussian_rotation = -(-.5 * gaussian * (delta_pos.outer_product(delta_pos) @ d_cov_inv_rotation).trace()) * cov_inv @ delta_pos - gaussian * d_cov_inv_rotation @ delta_pos
-								# derivative of loss_grad
-								rotations.grad[j_id] += weight_grad / (4. * m) * d_grad_gaussian_rotation.dot(sign_times_value)
-								if self.dim == 2:
-									# derivative of loss_vor
-									vor_rotations_grad[j_id] += weight_vor / m * d_grad_gaussian_rotation.dot(sign_dvor_times_value)
-									# derivative of loss_div
-									div_rotations_grad[j_id] += weight_div / m * d_grad_gaussian_rotation.dot(sign_div2_times_value)
+		# 						# derivative w.r.t. rotations
+		# 						d_cov_inv_rotation = (tm.exp(2. * scalings[j_id, 0]) - tm.exp(2. * scalings[j_id, 1])) * tm.mat2([[-tm.sin(2. * rotations[j_id]), tm.cos(2. * rotations[j_id])], [tm.cos(2. * rotations[j_id]), tm.sin(2. * rotations[j_id])]])
+		# 						d_grad_gaussian_rotation = -(-.5 * gaussian * (delta_pos.outer_product(delta_pos) @ d_cov_inv_rotation).trace()) * cov_inv @ delta_pos - gaussian * d_cov_inv_rotation @ delta_pos
+		# 						# derivative of loss_grad
+		# 						rotations.grad[j_id] += weight_grad / (4. * m) * d_grad_gaussian_rotation.dot(sign_times_value)
+		# 						if self.dim == 2:
+		# 							# derivative of loss_vor
+		# 							vor_rotations_grad[j_id] += weight_vor / m * d_grad_gaussian_rotation.dot(sign_dvor_times_value)
+		# 							# derivative of loss_div
+		# 							div_rotations_grad[j_id] += weight_div / m * d_grad_gaussian_rotation.dot(sign_div2_times_value)
 		
-		def get_grad_losses(self, x,
-							ref_grad=None, weight_grad=0.,
-							ref_vor=None, weight_vor=0.,
-							weight_div=0.,
-							vor_positions_grad=None, vor_scalings_grad=None, vor_rotations_grad=None, vor_values_grad=None,
-							div_positions_grad=None, div_scalings_grad=None, div_rotations_grad=None, div_values_grad=None,
-							stop_gradient=None):
-			if ref_grad is None:
-				ref_grad = torch.zeros((x.shape[0], self.dim, 2), device=device)
-				weight_grad = 0.
-			if ref_vor is None:
-				ref_vor = torch.zeros((x.shape[0],), device=device)
-				weight_vor = 0.
-			if stop_gradient is None:
-				stop_gradient = torch.zeros((self.positions.shape[0],), dtype=torch.int32, device=device)
-			grad = torch.zeros((x.shape[0], self.dim, 2), device=device)
-			if vor_positions_grad is None:
-				vor_positions_grad = self.positions.grad
-			if vor_scalings_grad is None:
-				vor_scalings_grad = self.scalings.grad
-			if vor_rotations_grad is None:
-				vor_rotations_grad = self.rotations.grad
-			if vor_values_grad is None:
-				vor_values_grad = self.values.grad
-			if div_positions_grad is None:
-				div_positions_grad = self.positions.grad
-			if div_scalings_grad is None:
-				div_scalings_grad = self.scalings.grad
-			if div_rotations_grad is None:
-				div_rotations_grad = self.rotations.grad
-			if div_values_grad is None:
-				div_values_grad = self.values.grad
-			self.get_grad_losses_ti(
-				self.positions, self.scalings, self.rotations, self.values,
-				self.grid_scale,
-				x,
-				ref_grad, weight_grad,
-				ref_vor, weight_vor,
-				weight_div,
-				grad,
-				vor_positions_grad, vor_scalings_grad, vor_rotations_grad, vor_values_grad,
-				div_positions_grad, div_scalings_grad, div_rotations_grad, div_values_grad,
-				stop_gradient)
-			return grad
+		# def get_grad_losses(self, x,
+		# 					ref_grad=None, weight_grad=0.,
+		# 					ref_vor=None, weight_vor=0.,
+		# 					weight_div=0.,
+		# 					vor_positions_grad=None, vor_scalings_grad=None, vor_rotations_grad=None, vor_values_grad=None,
+		# 					div_positions_grad=None, div_scalings_grad=None, div_rotations_grad=None, div_values_grad=None,
+		# 					stop_gradient=None):
+		# 	if ref_grad is None:
+		# 		ref_grad = torch.zeros((x.shape[0], self.dim, 2), device=device)
+		# 		weight_grad = 0.
+		# 	if ref_vor is None:
+		# 		ref_vor = torch.zeros((x.shape[0],), device=device)
+		# 		weight_vor = 0.
+		# 	if stop_gradient is None:
+		# 		stop_gradient = torch.zeros((self.positions.shape[0],), dtype=torch.int32, device=device)
+		# 	grad = torch.zeros((x.shape[0], self.dim, 2), device=device)
+		# 	if vor_positions_grad is None:
+		# 		vor_positions_grad = self.positions.grad
+		# 	if vor_scalings_grad is None:
+		# 		vor_scalings_grad = self.scalings.grad
+		# 	if vor_rotations_grad is None:
+		# 		vor_rotations_grad = self.rotations.grad
+		# 	if vor_values_grad is None:
+		# 		vor_values_grad = self.values.grad
+		# 	if div_positions_grad is None:
+		# 		div_positions_grad = self.positions.grad
+		# 	if div_scalings_grad is None:
+		# 		div_scalings_grad = self.scalings.grad
+		# 	if div_rotations_grad is None:
+		# 		div_rotations_grad = self.rotations.grad
+		# 	if div_values_grad is None:
+		# 		div_values_grad = self.values.grad
+		# 	self.get_grad_losses_ti(
+		# 		self.positions, self.scalings, self.rotations, self.values,
+		# 		self.grid_scale,
+		# 		x,
+		# 		ref_grad, weight_grad,
+		# 		ref_vor, weight_vor,
+		# 		weight_div,
+		# 		grad,
+		# 		vor_positions_grad, vor_scalings_grad, vor_rotations_grad, vor_values_grad,
+		# 		div_positions_grad, div_scalings_grad, div_rotations_grad, div_values_grad,
+		# 		stop_gradient)
+		# 	return grad
 		
-		def gradient(self, x, need_val=False):
-			grad = self.get_grad_losses(x)
-			return (grad, self.__call__(x)) if need_val else grad
+		# def gradient(self, x, need_val=False):
+		# 	grad = self.get_grad_losses(x)
+		# 	return (grad, self.__call__(x)) if need_val else grad
 		
-		@ti.func
-		def get_2d_val_grad_ti(self, positions: TiArr, scalings: TiArr, rotations: TiArr, values: TiArr, grid_scale: ti.f32, x: tm.vec2):
-			val = tm.vec2(0.)
-			grad = tm.mat2(0.)
-			idx, idy = int((x[0] - self.x_min) // grid_scale), int((x[1] - self.y_min) // grid_scale)
-			for gi in range(max(idx - 1, 0), min(idx + 1, self.grid_size[0] - 1) + 1):
-				for gj in range(max(idy - 1, 0), min(idy + 1, self.grid_size[1] - 1) + 1):
-					for j in range(ti.i32(self.grid_cnt[gi, gj])):
-						j_id = self.sorted_id[self.grid_offset[gi, gj] + j]
-						delta_pos = tm.vec2(x[0] - positions[j_id, 0], x[1] - positions[j_id, 1])
-						R = tm.mat2([[tm.cos(rotations[j_id]), -tm.sin(rotations[j_id])], [tm.sin(rotations[j_id]), tm.cos(rotations[j_id])]])
-						S2 = tm.mat2([[tm.exp(2. * scalings[j_id, 0]), 0.], [0., tm.exp(2. * scalings[j_id, 1])]])
-						cov_inv = R @ S2 @ R.transpose()
-						gaussian = tm.exp(-.5 * delta_pos @ cov_inv @ delta_pos)
-						if gaussian >= self.clamp_threshold:	# within range
-							grad_gaussian = -gaussian * (cov_inv @ delta_pos)
-							for d in range(self.dim):
-								val[d] += values[j_id, d] * (gaussian - self.clamp_threshold)
-								grad[d, 0] += values[j_id, d] * grad_gaussian[0]
-								grad[d, 1] += values[j_id, d] * grad_gaussian[1]
-			return val, grad
+		# @ti.func
+		# def get_2d_val_grad_ti(self, positions: TiArr, scalings: TiArr, rotations: TiArr, values: TiArr, grid_scale: ti.f32, x: tm.vec2):
+		# 	val = tm.vec2(0.)
+		# 	grad = tm.mat2(0.)
+		# 	idx, idy = int((x[0] - self.x_min) // grid_scale), int((x[1] - self.y_min) // grid_scale)
+		# 	for gi in range(max(idx - 1, 0), min(idx + 1, self.grid_size[0] - 1) + 1):
+		# 		for gj in range(max(idy - 1, 0), min(idy + 1, self.grid_size[1] - 1) + 1):
+		# 			for j in range(ti.i32(self.grid_cnt[gi, gj])):
+		# 				j_id = self.sorted_id[self.grid_offset[gi, gj] + j]
+		# 				delta_pos = tm.vec2(x[0] - positions[j_id, 0], x[1] - positions[j_id, 1])
+		# 				R = tm.mat2([[tm.cos(rotations[j_id]), -tm.sin(rotations[j_id])], [tm.sin(rotations[j_id]), tm.cos(rotations[j_id])]])
+		# 				S2 = tm.mat2([[tm.exp(2. * scalings[j_id, 0]), 0.], [0., tm.exp(2. * scalings[j_id, 1])]])
+		# 				cov_inv = R @ S2 @ R.transpose()
+		# 				gaussian = tm.exp(-.5 * delta_pos @ cov_inv @ delta_pos)
+		# 				if gaussian >= self.clamp_threshold:	# within range
+		# 					grad_gaussian = -gaussian * (cov_inv @ delta_pos)
+		# 					for d in range(self.dim):
+		# 						val[d] += values[j_id, d] * (gaussian - self.clamp_threshold)
+		# 						grad[d, 0] += values[j_id, d] * grad_gaussian[0]
+		# 						grad[d, 1] += values[j_id, d] * grad_gaussian[1]
+		# 	return val, grad
 		
-		@ti.kernel
-		def advection_rk4_ti(self,
-							positions: TiArr, scalings: TiArr, rotations: TiArr, values: TiArr, grid_scale: ti.f32,
-							start_pos: TiArr, dt: ti.f32,
-							goal_pos: TiArr, deformation: TiArr, goal_val: TiArr, goal_grad: TiArr):
-			for i in range(start_pos.shape[0]):
-				x = tm.vec2(start_pos[i, 0], start_pos[i, 1])
-				v, dv = self.get_2d_val_grad_ti(positions, scalings, rotations, values, grid_scale, x)
-				phi1 = x + dt * .5 * v
-				v1, dv1 = self.get_2d_val_grad_ti(positions, scalings, rotations, values, grid_scale, phi1)
-				phi2 = x + dt * .5 * v1
-				v2, dv2 = self.get_2d_val_grad_ti(positions, scalings, rotations, values, grid_scale, phi2)
-				phi3 = x + dt * v2
-				v3, dv3 = self.get_2d_val_grad_ti(positions, scalings, rotations, values, grid_scale, phi3)
-				phi = x + dt / 6. * (v + 2. * v1 + 2. * v2 + v3)
-				goal_pos[i, 0], goal_pos[i, 1] = phi[0], phi[1]
-				if deformation.shape[0] > 0:
-					dphi1 = tm.eye(2) + dt * .5 * dv
-					dv1_x_dphi1 = dv1 @ dphi1
-					dphi2 = tm.eye(2) + dt * .5 * dv1_x_dphi1
-					dv2_x_dphi2 = dv2 @ dphi2
-					dphi3 = tm.eye(2) + dt * dv2_x_dphi2
-					dphi = tm.eye(2) + dt / 6. * (dv + 2. * dv1_x_dphi1 + 2. * dv2_x_dphi2 + dv3 @ dphi3)
-					for j in range(2):
-						for k in range(2):
-							deformation[i, j, k] = dphi[j, k]
-				if goal_val.shape[0] > 0 and goal_grad.shape[0] > 0:
-					v_phi, dv_phi = self.get_2d_val_grad_ti(positions, scalings, rotations, values, grid_scale, phi)
-					goal_val[i, 0], goal_val[i, 1] = v_phi[0], v_phi[1]
-					for j in range(2):
-						for k in range(2):
-							goal_grad[i, j, k] = dv_phi[j, k]
+		# @ti.kernel
+		# def advection_rk4_ti(self,
+		# 					positions: TiArr, scalings: TiArr, rotations: TiArr, values: TiArr, grid_scale: ti.f32,
+		# 					start_pos: TiArr, dt: ti.f32,
+		# 					goal_pos: TiArr, deformation: TiArr, goal_val: TiArr, goal_grad: TiArr):
+		# 	for i in range(start_pos.shape[0]):
+		# 		x = tm.vec2(start_pos[i, 0], start_pos[i, 1])
+		# 		v, dv = self.get_2d_val_grad_ti(positions, scalings, rotations, values, grid_scale, x)
+		# 		phi1 = x + dt * .5 * v
+		# 		v1, dv1 = self.get_2d_val_grad_ti(positions, scalings, rotations, values, grid_scale, phi1)
+		# 		phi2 = x + dt * .5 * v1
+		# 		v2, dv2 = self.get_2d_val_grad_ti(positions, scalings, rotations, values, grid_scale, phi2)
+		# 		phi3 = x + dt * v2
+		# 		v3, dv3 = self.get_2d_val_grad_ti(positions, scalings, rotations, values, grid_scale, phi3)
+		# 		phi = x + dt / 6. * (v + 2. * v1 + 2. * v2 + v3)
+		# 		goal_pos[i, 0], goal_pos[i, 1] = phi[0], phi[1]
+		# 		if deformation.shape[0] > 0:
+		# 			dphi1 = tm.eye(2) + dt * .5 * dv
+		# 			dv1_x_dphi1 = dv1 @ dphi1
+		# 			dphi2 = tm.eye(2) + dt * .5 * dv1_x_dphi1
+		# 			dv2_x_dphi2 = dv2 @ dphi2
+		# 			dphi3 = tm.eye(2) + dt * dv2_x_dphi2
+		# 			dphi = tm.eye(2) + dt / 6. * (dv + 2. * dv1_x_dphi1 + 2. * dv2_x_dphi2 + dv3 @ dphi3)
+		# 			for j in range(2):
+		# 				for k in range(2):
+		# 					deformation[i, j, k] = dphi[j, k]
+		# 		if goal_val.shape[0] > 0 and goal_grad.shape[0] > 0:
+		# 			v_phi, dv_phi = self.get_2d_val_grad_ti(positions, scalings, rotations, values, grid_scale, phi)
+		# 			goal_val[i, 0], goal_val[i, 1] = v_phi[0], v_phi[1]
+		# 			for j in range(2):
+		# 				for k in range(2):
+		# 					goal_grad[i, j, k] = dv_phi[j, k]
 		
-		def advection_rk4(self, start_pos, dt, pos_only=True):
-			goal_pos = torch.zeros_like(start_pos, device=device)
-			deformation = torch.zeros((0 if pos_only else start_pos.shape[0], 2, 2), device=device)
-			goal_val = torch.zeros((0 if pos_only else start_pos.shape[0], 2), device=device)
-			goal_grad = torch.zeros((0 if pos_only else start_pos.shape[0], 2, 2), device=device)
-			self.advection_rk4_ti(
-				self.positions, self.scalings, self.rotations, self.values, self.grid_scale,
-				start_pos, dt,
-				goal_pos, deformation, goal_val, goal_grad
-			)
-			return goal_pos if pos_only else (goal_pos, deformation, goal_val, goal_grad)
+		# def advection_rk4(self, start_pos, dt, pos_only=True):
+		# 	goal_pos = torch.zeros_like(start_pos, device=device)
+		# 	deformation = torch.zeros((0 if pos_only else start_pos.shape[0], 2, 2), device=device)
+		# 	goal_val = torch.zeros((0 if pos_only else start_pos.shape[0], 2), device=device)
+		# 	goal_grad = torch.zeros((0 if pos_only else start_pos.shape[0], 2, 2), device=device)
+		# 	self.advection_rk4_ti(
+		# 		self.positions, self.scalings, self.rotations, self.values, self.grid_scale,
+		# 		start_pos, dt,
+		# 		goal_pos, deformation, goal_val, goal_grad
+		# 	)
+		# 	return goal_pos if pos_only else (goal_pos, deformation, goal_val, goal_grad)
 		
 		@ti.kernel
 		def get_coverage_ti(self,
@@ -794,39 +800,25 @@ def get_grid_points(x_min, x_max, y_min, y_max, x_N, y_N):
 	return XY.contiguous()
 
 
-def show_field(field, x_min, x_max, y_min, y_max, dim=1, x_N=100, y_N=100, additional_drawing=None, plt_show=True, save_filename=None):
-	if dim == 1:
-		XY = get_grid_points(x_min, x_max, y_min, y_max, x_N, y_N)
-		H = field(XY).reshape(y_N, x_N)
-		plt.axis('equal')
-		plt.imshow(H.detach().cpu(), extent=[x_min, x_max, y_min, y_max], origin='lower', cmap='jet')
-		plt.colorbar()
-	else:
-		XY_ = get_grid_points(x_min, x_max, y_min, y_max, x_N, y_N)
-		UV = field(XY_) # XY_ may change after calling field()
-		X_, Y_ = XY_[:, 0], XY_[:, 1]
-		U, V = UV[:, 0], UV[:, 1]
-		non_zero = (U**2 + V**2) != 0
-		plt.axis('equal')
-		if non_zero.any():
-			plt.quiver(X_.cpu(), Y_.cpu(), U.detach().cpu(), V.detach().cpu())
-	if additional_drawing:
-		additional_drawing()
-	if save_filename is None:
-		if plt_show:
-			plt.show()
-	else:
-		plt.savefig(save_filename)
-		plt.clf()
+def show_field(field, x_min, x_max, t_min, t_max, x_N=100, t_N=100, save_filename=None, plt_show=True):
+    x = torch.linspace(x_min, x_max, x_N)
+    t = torch.linspace(t_min, t_max, t_N)
+    X, T = torch.meshgrid(x, t, indexing='ij')
+    XT = torch.stack([X.flatten(), T.flatten()], dim=1)
+    with torch.no_grad():
+        val = field(XT).cpu().numpy()[:, 0]
+    val = val.reshape(x_N, t_N)
 
-
-def draw_ellipses(gaussian_splatting: GaussianSplatting, indices=None, scattering=True):
-	if scattering:
-		with torch.no_grad():
-			plt.scatter(gaussian_splatting.positions[:, 0].cpu(), gaussian_splatting.positions[:, 1].cpu(), s=.5, color='red')
-	ax = plt.gca()
-	with torch.no_grad():
-		for i in random.sample(list(range(gaussian_splatting.N)), min(20, gaussian_splatting.N)) if indices is None else indices:
-			width, height = (1. / torch.exp(gaussian_splatting.scalings[i])).cpu()
-			ellipse = Ellipse(gaussian_splatting.positions[i].cpu(), width, height, angle=gaussian_splatting.rotations[i].cpu() / torch.pi * 180., fill=False)
-			ax.add_patch(ellipse)
+    # 3. 绘图
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(3, 2.5))
+    im = plt.imshow(val, extent=(x_min, x_max, t_min, t_max), origin='lower', aspect='auto', cmap='RdBu_r')
+    plt.colorbar(im, orientation='horizontal', pad=0.15)
+    plt.xlabel(r'$x$')
+    plt.ylabel(r'$t$')
+    plt.tight_layout()
+    if save_filename:
+        plt.savefig(save_filename, dpi=300)
+        plt.close()
+    elif plt_show:
+        plt.show()
