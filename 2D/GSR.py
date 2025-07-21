@@ -21,7 +21,7 @@ def parse_args():
 	return parser.parse_args()
 cmd_args = parse_args()
 os.makedirs(cmd_args.dir, exist_ok=True)
-
+print(torch.cuda.is_available())
 torch.manual_seed(42)
 if cmd_args.device != 'cpu':
 	os.environ['CUDA_VISIBLE_DEVICES'] = cmd_args.device
@@ -118,7 +118,7 @@ class GaussianSplatting:
 		mu, sigma_inv = self.positions, self.get_variances()
 		positions_differences = x[:, None, :] - mu[None, :, :]
 		per_splatting_values = self.values * torch.exp(-.5 * positions_differences[:, :, None, :] @ sigma_inv @ positions_differences[:, :, :, None]).squeeze(3)
-		return per_splatting_values.sum(dim=0)
+		return per_splatting_values.sum(dim=1)
 	
 	def gradient_single(self, x, need_val=False):
 		'''
@@ -159,8 +159,9 @@ class GaussianSplatting:
 		self.values.requires_grad_()
 	
 	def zero_grad(self):
-		for o in self.optimizers:
-			o.zero_grad()
+		for param in [self.positions, self.scalings, self.rotations, self.values]:
+			if param.grad is not None:
+				param.grad = torch.zeros_like(param, device=param.device)  # 使用参数的设备
 	
 	def step(self, metrics):
 		for o in self.optimizers:
@@ -326,9 +327,7 @@ class GaussianSplattingFast(GaussianSplatting):
 				pde_parts[2] += c
 				boundary_loss[i] = weight_boundary * (val[i,0])**2
 				initial_loss[i] = weight_initial * (val[i,0]+tm.sin(tm.pi*x[i,0]))**2
-			#backward pass
-			if weight == 0 and weight_boundary == 0:    # disable backward
-				m = 0
+			
 			# (warning: need atomic '+=')
 			for i in range(m):
 				idx, idy = int((x[i, 0] - self.x_min) // grid_scale), int((x[i, 1] - self.y_min) // grid_scale)
@@ -763,11 +762,9 @@ class GaussianSplattingFast(GaussianSplatting):
 			return mark.bool()
 		
 		def zero_grad(self):
-			for param in super().parameters().values():
-				if param.grad is None:
-					param.grad = torch.zeros_like(param, device=device)
-				else:
-					param.grad.zero_()
+			for param in [self.positions, self.scalings, self.rotations, self.values]:
+				if param.grad is not None:
+					param.grad = torch.zeros_like(param, device=param.device)  # 使用参数的设备
 			self.reinitialize_grid()
 		
 		def step(self, metrics):
@@ -800,22 +797,22 @@ def get_grid_points(x_min, x_max, y_min, y_max, x_N, y_N):
 	return XY.contiguous()
 
 
-def show_field(field, x_min, x_max, t_min, t_max, x_N=100, t_N=100, save_filename=None, plt_show=True):
+def show_field(field, x_min, x_max, t_min, t_max, x_N=200, t_N=100, save_filename=None, plt_show=True):
     x = torch.linspace(x_min, x_max, x_N)
     t = torch.linspace(t_min, t_max, t_N)
     X, T = torch.meshgrid(x, t, indexing='ij')
     XT = torch.stack([X.flatten(), T.flatten()], dim=1)
+    XT = XT.to(field.positions.device)
     with torch.no_grad():
         val = field(XT).cpu().numpy()[:, 0]
     val = val.reshape(x_N, t_N)
 
-    # 3. 绘图
     import matplotlib.pyplot as plt
     plt.figure(figsize=(3, 2.5))
-    im = plt.imshow(val, extent=(x_min, x_max, t_min, t_max), origin='lower', aspect='auto', cmap='RdBu_r')
+    im = plt.imshow(val, extent=(t_min, t_max, x_min, x_max), origin='lower', aspect='auto', cmap='viridis')
     plt.colorbar(im, orientation='horizontal', pad=0.15)
-    plt.xlabel(r'$x$')
-    plt.ylabel(r'$t$')
+    plt.xlabel(r'$t$')
+    plt.ylabel(r'$x$')
     plt.tight_layout()
     if save_filename:
         plt.savefig(save_filename, dpi=300)

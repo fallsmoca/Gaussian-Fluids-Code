@@ -6,9 +6,10 @@ from GSR import *
 import matplotlib.pyplot as plt
 
 
-def fit_velocity_with_gradient(gaussian_velocity: GaussianSplattingFast, data_generator, data_boundary_generator, data_initial_generator, batch_size=512, max_epoch=3000, verbose=1):
+def fit_velocity_with_gradient(gaussian_velocity: GaussianSplattingFast, data_generator, data_boundary_generator, data_initial_generator, batch_size=256, max_epoch=10000, verbose=1):
     total_losses, pde_losses, bnd_losses, init_losses = [], [], [], []
 
+    total_start_time = time.time()
     st_time = time.time()
     gaussian_velocity.initialize_optimizers()
 
@@ -33,9 +34,23 @@ def fit_velocity_with_gradient(gaussian_velocity: GaussianSplattingFast, data_ge
         if verbose and epoch % 100 == 99:
             with torch.no_grad():
                 en_time = time.time()
+                elapsed_100_epochs = en_time - st_time
                 print(f'Epoch {epoch + 1}/{max_epoch}, loss:{loss}, pde:{pde_loss}, bnd:{boundary_loss}, init:{initial_loss}')
-                print('time:', en_time - st_time)
+                print(f'Last 100 epochs time: {elapsed_100_epochs:.2f}s')
                 st_time = time.time()
+                #show_field(gaussian_velocity, x_min=-1.0, x_max=1.0, t_min=0.0, t_max=1.0, x_N=200, t_N=100, save_filename=os.path.join(cmd_args.dir, f'prediction_xt_{epoch + 1}.png'))
+
+    # 计算总训练时间
+    total_end_time = time.time()
+    total_training_time = total_end_time - total_start_time
+    avg_100_epochs_time = total_training_time / (max_epoch / 100)
+
+    print("="*50)
+    print(f"Training completed!")
+    print(f"Total training time: {total_training_time:.2f} seconds ({total_training_time/60:.1f} minutes)")
+    print(f"Average time per 100 epochs: {avg_100_epochs_time:.2f} seconds")
+    print(f"Average time per epoch: {total_training_time/max_epoch:.3f} seconds")
+    print("="*50)
 
     plt.figure(figsize=(6,4))
     plt.plot(total_losses, label='total loss')
@@ -44,7 +59,7 @@ def fit_velocity_with_gradient(gaussian_velocity: GaussianSplattingFast, data_ge
     plt.plot(init_losses, label='initial loss')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
-    plt.yscale('log') 
+    plt.yscale('log')  # 移除对数坐标
     plt.legend()
     plt.title('Training Loss Curve')
     plt.show()
@@ -81,7 +96,7 @@ def SimulationInitialize():
 	# show_field(vorticity_field, x_min, x_max, y_min, y_max, x_N=x_Nvis, y_N=y_Nvis, save_filename=os.path.join(cmd_args.dir, 'refvorticity.png'))
 	# show_field(divergence_field, x_min, x_max, y_min, y_max, x_N=x_Nvis, y_N=y_Nvis, save_filename=os.path.join(cmd_args.dir, 'refdivergence.png'))
 	
-	x_N, y_N = 50,50
+	x_N, y_N = 60,30
 	gaussian_velocity = GaussianSplattingFast(x_min, x_max, y_min, y_max, get_grid_points(x_min, x_max, y_min, y_max, x_N, y_N).cpu().numpy(), dim=1)
 	print(f'Particle count: {gaussian_velocity.N} ({x_N} x {y_N})')
 	
@@ -101,11 +116,11 @@ def SimulationInitialize():
 		y = torch.zeros(n, device=device)
 		data = torch.stack([x, y], dim=1)
 		return data
-	
-	gaussian_velocity.set_lr(positions_lr=1.6e-3, scalings_lr=5e-2, rotations_lr=5e-2, values_lr=5e-3)
-	fit_velocity_with_gradient(gaussian_velocity, default_generator, boundary_data_generator, initial_data_generator, max_epoch=1000)
+	#positions_lr=1.6e-3, scalings_lr=5e-2, rotations_lr=5e-2, values_lr=5e-3
+	gaussian_velocity.set_lr(positions_lr=5.3e-4, scalings_lr=5.1e-2, rotations_lr=2.3e-2, values_lr=5.4e-2)
+	fit_velocity_with_gradient(gaussian_velocity, default_generator, boundary_data_generator, initial_data_generator, max_epoch=5000)
 	gaussian_velocity.save(os.path.join(cmd_args.dir, 'gaussian_velocity_0.pt'))
-	show_field(gaussian_velocity, x_min=-1.0, x_max=1.0, t_min=0.0, t_max=1.0, x_N=100, t_N=100, save_filename=os.path.join(cmd_args.dir, 'prediction_xt.png'))
+	show_field(gaussian_velocity, x_min=-1.0, x_max=1.0, t_min=0.0, t_max=1.0, x_N=200, t_N=100, save_filename=os.path.join(cmd_args.dir, 'prediction_xt.png'))
 	# def vorticity_gaussian(x):
 	# 	g = gaussian_velocity.gradient(x)
 	# 	return g[:, 1, 0] - g[:, 0, 1]
@@ -117,4 +132,4 @@ def SimulationInitialize():
 
 
 if __name__ == '__main__':
-	SimulationInitialize()
+    SimulationInitialize()
