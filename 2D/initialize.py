@@ -23,7 +23,6 @@ def fit_velocity_with_gradient(gaussian_velocity: GaussianSplattingFast, data_ge
         initial_loss = gaussian_velocity.get_losses(data_initial, weight=0., weight_boundary=0., weight_initial=1.)[3].mean()
         loss = pde_loss + boundary_loss + initial_loss
 
-        # 记录
         total_losses.append(loss.item())
         pde_losses.append(pde_loss.item())
         bnd_losses.append(boundary_loss.item())
@@ -59,7 +58,7 @@ def fit_velocity_with_gradient(gaussian_velocity: GaussianSplattingFast, data_ge
     plt.plot(init_losses, label='initial loss')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
-    plt.yscale('log')  # 移除对数坐标
+    plt.yscale('log') 
     plt.legend()
     plt.title('Training Loss Curve')
     plt.show()
@@ -117,7 +116,7 @@ def SimulationInitialize():
 		data = torch.stack([x, y], dim=1)
 		return data
 	#positions_lr=1.6e-3, scalings_lr=5e-2, rotations_lr=5e-2, values_lr=5e-3
-	gaussian_velocity.set_lr(positions_lr=5.3e-4, scalings_lr=5.1e-2, rotations_lr=2.3e-2, values_lr=5.4e-2)
+	gaussian_velocity.set_lr(positions_lr=5.e-4, scalings_lr=1.e-2, rotations_lr=1.e-2, values_lr=1.e-2)
 	fit_velocity_with_gradient(gaussian_velocity, default_generator, boundary_data_generator, initial_data_generator, max_epoch=5000)
 	gaussian_velocity.save(os.path.join(cmd_args.dir, 'gaussian_velocity_0.pt'))
 	show_field(gaussian_velocity, x_min=-1.0, x_max=1.0, t_min=0.0, t_max=1.0, x_N=200, t_N=100, save_filename=os.path.join(cmd_args.dir, 'prediction_xt.png'))
